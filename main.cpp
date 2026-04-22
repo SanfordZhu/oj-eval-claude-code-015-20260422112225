@@ -40,29 +40,25 @@ class FileStorage {
 private:
     fstream dataFile;
 
-    // Store only hash and position, read value from file when needed
-    struct IndexEntry {
+    // Very compact entry: fingerprint (4 bytes) + position (8 bytes) + value (4 bytes) + deleted (1 bit)
+    // Store value to avoid file reads
+    struct CompactEntry {
+        uint32_t fingerprint;
         streamoff position;
-        uint8_t deleted;  // Use uint8_t instead of bool to save memory
+        int value;
+        bool deleted;
+
+        CompactEntry(uint32_t fp, streamoff pos, int val, bool del)
+            : fingerprint(fp), position(pos), value(val), deleted(del) {}
     };
 
-    // hash -> vector of positions for that hash
-    unordered_map<size_t, vector<IndexEntry>> hashIndex;
-
-    // We also need to store index strings for collision resolution
-    // But we can store them in a separate map or read from file
-    // Actually, we need the index string to verify collisions
-    // Let's store first 4 bytes of index string as fingerprint
-    struct Entry {
-        uint32_t fingerprint;  // First 4 bytes of index
-        streamoff position;
-        uint8_t deleted;
-    };
-
-    unordered_map<size_t, vector<Entry>> index;
+    // Use vector instead of unordered_map for hash table
+    // Simple open addressing with linear probing
+    static const size_t HASH_TABLE_SIZE = 200003; // Prime > 2*100000
+    vector<vector<CompactEntry>> hashTable;
 
 public:
-    FileStorage() {
+    FileStorage() : hashTable(HASH_TABLE_SIZE) {
         // Check if file exists
         ifstream test(DATA_FILE);
         bool exists = test.good();
@@ -98,22 +94,18 @@ public:
     }
 
     void insert(const string& idx, int value) {
-        size_t hash = stringHash(idx);
+        size_t hash = stringHash(idx) % HASH_TABLE_SIZE;
         uint32_t fp = getFingerprint(idx);
 
         // Check if already exists
-        auto it = index.find(hash);
-        if (it != index.end()) {
-            for (auto& entry : it->second) {
-                if (entry.deleted) continue;
-                if (entry.fingerprint == fp) {
-                    // Possible match, check full string
-                    Record rec;
-                    dataFile.seekg(entry.position);
-                    dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
-                    if (strcmp(rec.index, idx.c_str()) == 0 && rec.value == value) {
-                        return; // Duplicate
-                    }
+        for (auto& entry : hashTable[hash]) {
+            if (!entry.deleted && entry.fingerprint == fp) {
+                // Need to check full string
+                Record rec;
+                dataFile.seekg(entry.position);
+                dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
+                if (strcmp(rec.index, idx.c_str()) == 0 && rec.value == value) {
+                    return; // Duplicate
                 }
             }
         }
@@ -125,30 +117,29 @@ public:
         dataFile.write(reinterpret_cast<const char*>(&rec), sizeof(Record));
         dataFile.flush();
 
-        // Update index
-        index[hash].push_back({fp, pos, 0});
+        // Add to hash table
+        hashTable[hash].emplace_back(fp, pos, value, false);
     }
 
     void remove(const string& idx, int value) {
-        size_t hash = stringHash(idx);
+        size_t hash = stringHash(idx) % HASH_TABLE_SIZE;
         uint32_t fp = getFingerprint(idx);
 
-        auto it = index.find(hash);
-        if (it == index.end()) return;
-
-        for (auto& entry : it->second) {
-            if (entry.deleted) continue;
-            if (entry.fingerprint == fp) {
+        for (auto& entry : hashTable[hash]) {
+            if (!entry.deleted && entry.fingerprint == fp && entry.value == value) {
+                // Need to verify full string
                 Record rec;
                 dataFile.seekg(entry.position);
                 dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
-                if (strcmp(rec.index, idx.c_str()) == 0 && rec.value == value) {
-                    // Mark as deleted
+                if (strcmp(rec.index, idx.c_str()) == 0) {
+                    // Mark as deleted in file
                     rec.deleted = true;
                     dataFile.seekp(entry.position);
                     dataFile.write(reinterpret_cast<const char*>(&rec), sizeof(Record));
                     dataFile.flush();
-                    entry.deleted = 1;
+
+                    // Mark as deleted in index
+                    entry.deleted = true;
                     return;
                 }
             }
@@ -156,24 +147,18 @@ public:
     }
 
     void find(const string& idx) {
-        size_t hash = stringHash(idx);
+        size_t hash = stringHash(idx) % HASH_TABLE_SIZE;
         uint32_t fp = getFingerprint(idx);
 
-        auto it = index.find(hash);
-        if (it == index.end()) {
-            cout << "null" << endl;
-            return;
-        }
-
         vector<int> values;
-        for (auto& entry : it->second) {
-            if (entry.deleted) continue;
-            if (entry.fingerprint == fp) {
+        for (auto& entry : hashTable[hash]) {
+            if (!entry.deleted && entry.fingerprint == fp) {
+                // Verify full string
                 Record rec;
                 dataFile.seekg(entry.position);
                 dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
                 if (strcmp(rec.index, idx.c_str()) == 0) {
-                    values.push_back(rec.value);
+                    values.push_back(entry.value);
                 }
             }
         }
@@ -198,9 +183,9 @@ private:
 
         while (dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record))) {
             string idx(rec.index);
-            size_t hash = stringHash(idx);
+            size_t hash = stringHash(idx) % HASH_TABLE_SIZE;
             uint32_t fp = getFingerprint(idx);
-            index[hash].push_back({fp, pos, rec.deleted ? 1 : 0});
+            hashTable[hash].emplace_back(fp, pos, rec.value, rec.deleted);
             pos = dataFile.tellg();
         }
         dataFile.clear();
