@@ -27,11 +27,39 @@ struct Record {
     }
 };
 
+// djb2 hash
+size_t stringHash(const string& str) {
+    size_t hash = 5381;
+    for (char c : str) {
+        hash = ((hash << 5) + hash) + (unsigned char)c;
+    }
+    return hash;
+}
+
 class FileStorage {
 private:
     fstream dataFile;
-    unordered_map<string, vector<streamoff>> index;  // index -> positions in file
-    unordered_map<streamoff, uint8_t> deletedMap;  // position -> deleted status (uint8_t to save memory)
+
+    // Store only hash and position, read value from file when needed
+    struct IndexEntry {
+        streamoff position;
+        uint8_t deleted;  // Use uint8_t instead of bool to save memory
+    };
+
+    // hash -> vector of positions for that hash
+    unordered_map<size_t, vector<IndexEntry>> hashIndex;
+
+    // We also need to store index strings for collision resolution
+    // But we can store them in a separate map or read from file
+    // Actually, we need the index string to verify collisions
+    // Let's store first 4 bytes of index string as fingerprint
+    struct Entry {
+        uint32_t fingerprint;  // First 4 bytes of index
+        streamoff position;
+        uint8_t deleted;
+    };
+
+    unordered_map<size_t, vector<Entry>> index;
 
 public:
     FileStorage() {
@@ -61,17 +89,31 @@ public:
         }
     }
 
+    uint32_t getFingerprint(const string& str) {
+        uint32_t fp = 0;
+        for (size_t i = 0; i < 4 && i < str.size(); ++i) {
+            fp = (fp << 8) | (unsigned char)str[i];
+        }
+        return fp;
+    }
+
     void insert(const string& idx, int value) {
-        // Check if already exists using index
-        if (index.find(idx) != index.end()) {
-            for (streampos pos : index[idx]) {
-                if (deletedMap[pos]) continue;
-                Record rec;
-                dataFile.seekg(pos);
-                dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
-                if (rec.value == value) {
-                    // Duplicate (index, value) pair
-                    return;
+        size_t hash = stringHash(idx);
+        uint32_t fp = getFingerprint(idx);
+
+        // Check if already exists
+        auto it = index.find(hash);
+        if (it != index.end()) {
+            for (auto& entry : it->second) {
+                if (entry.deleted) continue;
+                if (entry.fingerprint == fp) {
+                    // Possible match, check full string
+                    Record rec;
+                    dataFile.seekg(entry.position);
+                    dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
+                    if (strcmp(rec.index, idx.c_str()) == 0 && rec.value == value) {
+                        return; // Duplicate
+                    }
                 }
             }
         }
@@ -84,43 +126,56 @@ public:
         dataFile.flush();
 
         // Update index
-        index[idx].push_back(pos);
-        deletedMap[pos] = 0;
+        index[hash].push_back({fp, pos, 0});
     }
 
     void remove(const string& idx, int value) {
-        if (index.find(idx) == index.end()) return;
+        size_t hash = stringHash(idx);
+        uint32_t fp = getFingerprint(idx);
 
-        for (streamoff pos : index[idx]) {
-            if (deletedMap[pos]) continue;
-            Record rec;
-            dataFile.seekg(pos);
-            dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
-            if (rec.value == value) {
-                // Mark as deleted
-                rec.deleted = true;
-                dataFile.seekp(pos);
-                dataFile.write(reinterpret_cast<const char*>(&rec), sizeof(Record));
-                dataFile.flush();
-                deletedMap[pos] = 1;
-                return;
+        auto it = index.find(hash);
+        if (it == index.end()) return;
+
+        for (auto& entry : it->second) {
+            if (entry.deleted) continue;
+            if (entry.fingerprint == fp) {
+                Record rec;
+                dataFile.seekg(entry.position);
+                dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
+                if (strcmp(rec.index, idx.c_str()) == 0 && rec.value == value) {
+                    // Mark as deleted
+                    rec.deleted = true;
+                    dataFile.seekp(entry.position);
+                    dataFile.write(reinterpret_cast<const char*>(&rec), sizeof(Record));
+                    dataFile.flush();
+                    entry.deleted = 1;
+                    return;
+                }
             }
         }
     }
 
     void find(const string& idx) {
-        if (index.find(idx) == index.end()) {
+        size_t hash = stringHash(idx);
+        uint32_t fp = getFingerprint(idx);
+
+        auto it = index.find(hash);
+        if (it == index.end()) {
             cout << "null" << endl;
             return;
         }
 
         vector<int> values;
-        for (streamoff pos : index[idx]) {
-            if (deletedMap[pos]) continue;
-            Record rec;
-            dataFile.seekg(pos);
-            dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
-            values.push_back(rec.value);
+        for (auto& entry : it->second) {
+            if (entry.deleted) continue;
+            if (entry.fingerprint == fp) {
+                Record rec;
+                dataFile.seekg(entry.position);
+                dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
+                if (strcmp(rec.index, idx.c_str()) == 0) {
+                    values.push_back(rec.value);
+                }
+            }
         }
 
         if (values.empty()) {
@@ -143,8 +198,9 @@ private:
 
         while (dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record))) {
             string idx(rec.index);
-            index[idx].push_back(pos);
-            deletedMap[pos] = rec.deleted ? 1 : 0;
+            size_t hash = stringHash(idx);
+            uint32_t fp = getFingerprint(idx);
+            index[hash].push_back({fp, pos, rec.deleted ? 1 : 0});
             pos = dataFile.tellg();
         }
         dataFile.clear();
