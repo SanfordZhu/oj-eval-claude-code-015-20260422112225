@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <unordered_map>
 #include <cstring>
 
 using namespace std;
@@ -11,7 +12,7 @@ const int MAX_INDEX_LEN = 64;
 const char DATA_FILE[] = "data.bin";
 
 struct Record {
-    char index[MAX_INDEX_LEN + 1];  // +1 for null terminator
+    char index[MAX_INDEX_LEN + 1];
     int value;
     bool deleted;
 
@@ -28,6 +29,8 @@ struct Record {
 class FileStorage {
 private:
     fstream dataFile;
+    unordered_map<string, vector<streamoff>> index;  // index -> positions in file
+    unordered_map<streamoff, bool> deletedMap;  // position -> deleted status
 
 public:
     FileStorage() {
@@ -36,15 +39,15 @@ public:
         bool exists = test.good();
         test.close();
 
-        // Open data file in binary mode for reading and writing
+        // Open data file
         if (exists) {
             dataFile.open(DATA_FILE, ios::in | ios::out | ios::binary);
+            loadIndex();
         } else {
             dataFile.open(DATA_FILE, ios::in | ios::out | ios::binary | ios::trunc);
         }
 
         if (!dataFile) {
-            // Fallback: create empty file
             ofstream create(DATA_FILE, ios::binary);
             create.close();
             dataFile.open(DATA_FILE, ios::in | ios::out | ios::binary);
@@ -57,60 +60,66 @@ public:
         }
     }
 
-    void insert(const string& index, int value) {
-        // Check if record already exists
-        vector<streampos> positions;
-        findAllPositions(index, positions);
-
-        for (streampos pos : positions) {
-            Record rec;
-            dataFile.seekg(pos);
-            dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
-            if (!rec.deleted && rec.value == value) {
-                // Duplicate (index, value) pair, do nothing
-                return;
+    void insert(const string& idx, int value) {
+        // Check if already exists using index
+        if (index.find(idx) != index.end()) {
+            for (streampos pos : index[idx]) {
+                if (deletedMap[pos]) continue;
+                Record rec;
+                dataFile.seekg(pos);
+                dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
+                if (rec.value == value) {
+                    // Duplicate (index, value) pair
+                    return;
+                }
             }
         }
 
         // Append new record
-        Record rec(index, value);
+        Record rec(idx, value);
         dataFile.seekp(0, ios::end);
+        streamoff pos = dataFile.tellp();
         dataFile.write(reinterpret_cast<const char*>(&rec), sizeof(Record));
         dataFile.flush();
+
+        // Update index
+        index[idx].push_back(pos);
+        deletedMap[pos] = false;
     }
 
-    void remove(const string& index, int value) {
-        vector<streampos> positions;
-        findAllPositions(index, positions);
+    void remove(const string& idx, int value) {
+        if (index.find(idx) == index.end()) return;
 
-        for (streampos pos : positions) {
+        for (streamoff pos : index[idx]) {
+            if (deletedMap[pos]) continue;
             Record rec;
             dataFile.seekg(pos);
             dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
-            if (!rec.deleted && rec.value == value) {
+            if (rec.value == value) {
                 // Mark as deleted
                 rec.deleted = true;
                 dataFile.seekp(pos);
                 dataFile.write(reinterpret_cast<const char*>(&rec), sizeof(Record));
                 dataFile.flush();
+                deletedMap[pos] = true;
                 return;
             }
         }
-        // Not found, do nothing as per problem statement
     }
 
-    void find(const string& index) {
-        vector<int> values;
-        vector<streampos> positions;
-        findAllPositions(index, positions);
+    void find(const string& idx) {
+        if (index.find(idx) == index.end()) {
+            cout << "null" << endl;
+            return;
+        }
 
-        for (streampos pos : positions) {
+        vector<int> values;
+        for (streamoff pos : index[idx]) {
+            if (deletedMap[pos]) continue;
             Record rec;
             dataFile.seekg(pos);
             dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
-            if (!rec.deleted) {
-                values.push_back(rec.value);
-            }
+            values.push_back(rec.value);
         }
 
         if (values.empty()) {
@@ -126,18 +135,18 @@ public:
     }
 
 private:
-    void findAllPositions(const string& index, vector<streampos>& positions) {
+    void loadIndex() {
         dataFile.seekg(0, ios::beg);
         Record rec;
-        streampos pos = dataFile.tellg();
+        streamoff pos = dataFile.tellg();
 
         while (dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record))) {
-            if (strcmp(rec.index, index.c_str()) == 0) {
-                positions.push_back(pos);
-            }
+            string idx(rec.index);
+            index[idx].push_back(pos);
+            deletedMap[pos] = rec.deleted;
             pos = dataFile.tellg();
         }
-        dataFile.clear();  // Clear EOF flag
+        dataFile.clear();
     }
 };
 
@@ -148,17 +157,14 @@ int main() {
     FileStorage storage;
     int n;
     cin >> n;
-    cin.ignore();  // Ignore newline after n
+    cin.ignore();
 
     for (int i = 0; i < n; ++i) {
         string line;
         getline(cin, line);
 
-        // Parse command
         size_t firstSpace = line.find(' ');
-        if (firstSpace == string::npos) {
-            continue;  // Invalid command
-        }
+        if (firstSpace == string::npos) continue;
 
         string cmd = line.substr(0, firstSpace);
         string rest = line.substr(firstSpace + 1);
