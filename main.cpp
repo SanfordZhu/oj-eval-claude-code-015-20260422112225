@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <cstring>
+#include <cstdint>
 
 using namespace std;
 
@@ -26,10 +27,28 @@ struct Record {
     }
 };
 
+// Simple hash function
+size_t stringHash(const string& str) {
+    size_t hash = 5381;
+    for (char c : str) {
+        hash = ((hash << 5) + hash) + (unsigned char)c;
+    }
+    return hash;
+}
+
 class FileStorage {
 private:
     fstream dataFile;
-    unordered_map<string, vector<int>> index;  // index -> values (sorted)
+
+    // Store hash instead of full string to save memory
+    struct IndexEntry {
+        string index;  // Still need string for collision resolution
+        streamoff position;
+        int value;
+        bool deleted;
+    };
+
+    unordered_map<size_t, vector<IndexEntry>> hashIndex;
 
 public:
     FileStorage() {
@@ -60,85 +79,90 @@ public:
     }
 
     void insert(const string& idx, int value) {
+        size_t hash = stringHash(idx);
+
         // Check if already exists
-        auto it = index.find(idx);
-        if (it != index.end()) {
-            vector<int>& values = it->second;
-            // Binary search for value
-            auto pos = lower_bound(values.begin(), values.end(), value);
-            if (pos != values.end() && *pos == value) {
-                // Duplicate (index, value) pair
-                return;
+        auto it = hashIndex.find(hash);
+        if (it != hashIndex.end()) {
+            for (auto& entry : it->second) {
+                if (entry.index == idx && entry.value == value && !entry.deleted) {
+                    return; // Duplicate
+                }
             }
-            // Insert at correct position to keep sorted
-            values.insert(pos, value);
-        } else {
-            // New index
-            index[idx] = {value};
         }
 
-        // Write to file
+        // Append new record
         Record rec(idx, value);
         dataFile.seekp(0, ios::end);
+        streamoff pos = dataFile.tellp();
         dataFile.write(reinterpret_cast<const char*>(&rec), sizeof(Record));
         dataFile.flush();
+
+        // Update index
+        hashIndex[hash].push_back({idx, pos, value, false});
     }
 
     void remove(const string& idx, int value) {
-        auto it = index.find(idx);
-        if (it == index.end()) return;
+        size_t hash = stringHash(idx);
+        auto it = hashIndex.find(hash);
+        if (it == hashIndex.end()) return;
 
-        vector<int>& values = it->second;
-        auto pos = lower_bound(values.begin(), values.end(), value);
-        if (pos != values.end() && *pos == value) {
-            // Remove from vector
-            values.erase(pos);
-            // If vector becomes empty, remove key from map
-            if (values.empty()) {
-                index.erase(it);
+        for (auto& entry : it->second) {
+            if (entry.index == idx && entry.value == value && !entry.deleted) {
+                // Mark as deleted in file
+                Record rec;
+                dataFile.seekg(entry.position);
+                dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
+                rec.deleted = true;
+                dataFile.seekp(entry.position);
+                dataFile.write(reinterpret_cast<const char*>(&rec), sizeof(Record));
+                dataFile.flush();
+
+                // Mark as deleted in index
+                entry.deleted = true;
+                return;
             }
-
-            // Mark as deleted in file (optional, for consistency)
-            // We would need to find the record in file... skip for now
-            // File marking is not strictly needed since we use in-memory index
         }
     }
 
     void find(const string& idx) {
-        auto it = index.find(idx);
-        if (it == index.end() || it->second.empty()) {
+        size_t hash = stringHash(idx);
+        auto it = hashIndex.find(hash);
+        if (it == hashIndex.end()) {
             cout << "null" << endl;
             return;
         }
 
-        const vector<int>& values = it->second;
-        for (size_t i = 0; i < values.size(); ++i) {
-            if (i > 0) cout << " ";
-            cout << values[i];
+        vector<int> values;
+        for (auto& entry : it->second) {
+            if (entry.index == idx && !entry.deleted) {
+                values.push_back(entry.value);
+            }
         }
-        cout << endl;
+
+        if (values.empty()) {
+            cout << "null" << endl;
+        } else {
+            sort(values.begin(), values.end());
+            for (size_t i = 0; i < values.size(); ++i) {
+                if (i > 0) cout << " ";
+                cout << values[i];
+            }
+            cout << endl;
+        }
     }
 
 private:
     void loadIndex() {
         dataFile.seekg(0, ios::beg);
         Record rec;
+        streamoff pos = dataFile.tellg();
 
         while (dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record))) {
-            if (!rec.deleted) {
-                string idx(rec.index);
-                // Insert maintaining sorted order
-                auto it = index.find(idx);
-                if (it != index.end()) {
-                    vector<int>& values = it->second;
-                    auto pos = lower_bound(values.begin(), values.end(), rec.value);
-                    if (pos == values.end() || *pos != rec.value) {
-                        values.insert(pos, rec.value);
-                    }
-                } else {
-                    index[idx] = {rec.value};
-                }
-            }
+            string idx(rec.index);
+            size_t hash = stringHash(idx);
+            hashIndex[hash].push_back({idx, pos, rec.value, rec.deleted});
+            pos = dataFile.tellg();
         }
         dataFile.clear();
     }
