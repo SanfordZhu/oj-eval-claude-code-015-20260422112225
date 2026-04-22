@@ -27,28 +27,11 @@ struct Record {
     }
 };
 
-// Simple hash function
-size_t stringHash(const string& str) {
-    size_t hash = 5381;
-    for (char c : str) {
-        hash = ((hash << 5) + hash) + (unsigned char)c;
-    }
-    return hash;
-}
-
 class FileStorage {
 private:
     fstream dataFile;
-
-    // Store hash instead of full string to save memory
-    struct IndexEntry {
-        string index;  // Still need string for collision resolution
-        streamoff position;
-        int value;
-        bool deleted;
-    };
-
-    unordered_map<size_t, vector<IndexEntry>> hashIndex;
+    unordered_map<string, vector<streamoff>> index;  // index -> positions in file
+    unordered_map<streamoff, uint8_t> deletedMap;  // position -> deleted status (uint8_t to save memory)
 
 public:
     FileStorage() {
@@ -79,14 +62,16 @@ public:
     }
 
     void insert(const string& idx, int value) {
-        size_t hash = stringHash(idx);
-
-        // Check if already exists
-        auto it = hashIndex.find(hash);
-        if (it != hashIndex.end()) {
-            for (auto& entry : it->second) {
-                if (entry.index == idx && entry.value == value && !entry.deleted) {
-                    return; // Duplicate
+        // Check if already exists using index
+        if (index.find(idx) != index.end()) {
+            for (streampos pos : index[idx]) {
+                if (deletedMap[pos]) continue;
+                Record rec;
+                dataFile.seekg(pos);
+                dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
+                if (rec.value == value) {
+                    // Duplicate (index, value) pair
+                    return;
                 }
             }
         }
@@ -99,45 +84,43 @@ public:
         dataFile.flush();
 
         // Update index
-        hashIndex[hash].push_back({idx, pos, value, false});
+        index[idx].push_back(pos);
+        deletedMap[pos] = 0;
     }
 
     void remove(const string& idx, int value) {
-        size_t hash = stringHash(idx);
-        auto it = hashIndex.find(hash);
-        if (it == hashIndex.end()) return;
+        if (index.find(idx) == index.end()) return;
 
-        for (auto& entry : it->second) {
-            if (entry.index == idx && entry.value == value && !entry.deleted) {
-                // Mark as deleted in file
-                Record rec;
-                dataFile.seekg(entry.position);
-                dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
+        for (streamoff pos : index[idx]) {
+            if (deletedMap[pos]) continue;
+            Record rec;
+            dataFile.seekg(pos);
+            dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
+            if (rec.value == value) {
+                // Mark as deleted
                 rec.deleted = true;
-                dataFile.seekp(entry.position);
+                dataFile.seekp(pos);
                 dataFile.write(reinterpret_cast<const char*>(&rec), sizeof(Record));
                 dataFile.flush();
-
-                // Mark as deleted in index
-                entry.deleted = true;
+                deletedMap[pos] = 1;
                 return;
             }
         }
     }
 
     void find(const string& idx) {
-        size_t hash = stringHash(idx);
-        auto it = hashIndex.find(hash);
-        if (it == hashIndex.end()) {
+        if (index.find(idx) == index.end()) {
             cout << "null" << endl;
             return;
         }
 
         vector<int> values;
-        for (auto& entry : it->second) {
-            if (entry.index == idx && !entry.deleted) {
-                values.push_back(entry.value);
-            }
+        for (streamoff pos : index[idx]) {
+            if (deletedMap[pos]) continue;
+            Record rec;
+            dataFile.seekg(pos);
+            dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
+            values.push_back(rec.value);
         }
 
         if (values.empty()) {
@@ -160,8 +143,8 @@ private:
 
         while (dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record))) {
             string idx(rec.index);
-            size_t hash = stringHash(idx);
-            hashIndex[hash].push_back({idx, pos, rec.value, rec.deleted});
+            index[idx].push_back(pos);
+            deletedMap[pos] = rec.deleted ? 1 : 0;
             pos = dataFile.tellg();
         }
         dataFile.clear();
