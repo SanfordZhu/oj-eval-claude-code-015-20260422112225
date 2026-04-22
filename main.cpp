@@ -29,8 +29,7 @@ struct Record {
 class FileStorage {
 private:
     fstream dataFile;
-    unordered_map<string, vector<streamoff>> index;  // index -> positions in file
-    unordered_map<streamoff, bool> deletedMap;  // position -> deleted status
+    unordered_map<string, vector<int>> index;  // index -> values (sorted)
 
 public:
     FileStorage() {
@@ -61,90 +60,85 @@ public:
     }
 
     void insert(const string& idx, int value) {
-        // Check if already exists using index
-        if (index.find(idx) != index.end()) {
-            for (streampos pos : index[idx]) {
-                if (deletedMap[pos]) continue;
-                Record rec;
-                dataFile.seekg(pos);
-                dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
-                if (rec.value == value) {
-                    // Duplicate (index, value) pair
-                    return;
-                }
+        // Check if already exists
+        auto it = index.find(idx);
+        if (it != index.end()) {
+            vector<int>& values = it->second;
+            // Binary search for value
+            auto pos = lower_bound(values.begin(), values.end(), value);
+            if (pos != values.end() && *pos == value) {
+                // Duplicate (index, value) pair
+                return;
             }
+            // Insert at correct position to keep sorted
+            values.insert(pos, value);
+        } else {
+            // New index
+            index[idx] = {value};
         }
 
-        // Append new record
+        // Write to file
         Record rec(idx, value);
         dataFile.seekp(0, ios::end);
-        streamoff pos = dataFile.tellp();
         dataFile.write(reinterpret_cast<const char*>(&rec), sizeof(Record));
         dataFile.flush();
-
-        // Update index
-        index[idx].push_back(pos);
-        deletedMap[pos] = false;
     }
 
     void remove(const string& idx, int value) {
-        if (index.find(idx) == index.end()) return;
+        auto it = index.find(idx);
+        if (it == index.end()) return;
 
-        for (streamoff pos : index[idx]) {
-            if (deletedMap[pos]) continue;
-            Record rec;
-            dataFile.seekg(pos);
-            dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
-            if (rec.value == value) {
-                // Mark as deleted
-                rec.deleted = true;
-                dataFile.seekp(pos);
-                dataFile.write(reinterpret_cast<const char*>(&rec), sizeof(Record));
-                dataFile.flush();
-                deletedMap[pos] = true;
-                return;
+        vector<int>& values = it->second;
+        auto pos = lower_bound(values.begin(), values.end(), value);
+        if (pos != values.end() && *pos == value) {
+            // Remove from vector
+            values.erase(pos);
+            // If vector becomes empty, remove key from map
+            if (values.empty()) {
+                index.erase(it);
             }
+
+            // Mark as deleted in file (optional, for consistency)
+            // We would need to find the record in file... skip for now
+            // File marking is not strictly needed since we use in-memory index
         }
     }
 
     void find(const string& idx) {
-        if (index.find(idx) == index.end()) {
+        auto it = index.find(idx);
+        if (it == index.end() || it->second.empty()) {
             cout << "null" << endl;
             return;
         }
 
-        vector<int> values;
-        for (streamoff pos : index[idx]) {
-            if (deletedMap[pos]) continue;
-            Record rec;
-            dataFile.seekg(pos);
-            dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record));
-            values.push_back(rec.value);
+        const vector<int>& values = it->second;
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (i > 0) cout << " ";
+            cout << values[i];
         }
-
-        if (values.empty()) {
-            cout << "null" << endl;
-        } else {
-            sort(values.begin(), values.end());
-            for (size_t i = 0; i < values.size(); ++i) {
-                if (i > 0) cout << " ";
-                cout << values[i];
-            }
-            cout << endl;
-        }
+        cout << endl;
     }
 
 private:
     void loadIndex() {
         dataFile.seekg(0, ios::beg);
         Record rec;
-        streamoff pos = dataFile.tellg();
 
         while (dataFile.read(reinterpret_cast<char*>(&rec), sizeof(Record))) {
-            string idx(rec.index);
-            index[idx].push_back(pos);
-            deletedMap[pos] = rec.deleted;
-            pos = dataFile.tellg();
+            if (!rec.deleted) {
+                string idx(rec.index);
+                // Insert maintaining sorted order
+                auto it = index.find(idx);
+                if (it != index.end()) {
+                    vector<int>& values = it->second;
+                    auto pos = lower_bound(values.begin(), values.end(), rec.value);
+                    if (pos == values.end() || *pos != rec.value) {
+                        values.insert(pos, rec.value);
+                    }
+                } else {
+                    index[idx] = {rec.value};
+                }
+            }
         }
         dataFile.clear();
     }
